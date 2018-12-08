@@ -31,20 +31,29 @@ import os
 import numpy as np
 import facenet
 
+#10-折交叉验证得到最优的分类距离阈值
+# 计算true positive rate,false positive rate,accuracy ,用来绘制roc曲线
+#计算验证准确率，标准差，错误接受率，false accept rate
 def evaluate(embeddings, actual_issame, nrof_folds=10, distance_metric=0, subtract_mean=False):
     # Calculate evaluation metrics
-    thresholds = np.arange(0, 4, 0.01)
+    thresholds = np.arange(0, 4, 0.01)          #用来判定TP,FP的阈值，从0-4，0.01间隔，交叉验证，可以得出最优的threadhold
     embeddings1 = embeddings[0::2]
     embeddings2 = embeddings[1::2]
+
     tpr, fpr, accuracy = facenet.calculate_roc(thresholds, embeddings1, embeddings2,
         np.asarray(actual_issame), nrof_folds=nrof_folds, distance_metric=distance_metric, subtract_mean=subtract_mean)
+
     thresholds = np.arange(0, 4, 0.001)
     val, val_std, far = facenet.calculate_val(thresholds, embeddings1, embeddings2,
         np.asarray(actual_issame), 1e-3, nrof_folds=nrof_folds, distance_metric=distance_metric, subtract_mean=subtract_mean)
+
     return tpr, fpr, accuracy, val, val_std, far
 
+#返回人脸对，是否同一人的文件路径，用于从磁盘读取数据
+#path_list:list of (path0,path1)
+#issame_list:list of bool(path0 and path1 are same person) corresponding
 def get_paths(lfw_dir, pairs):
-    nrof_skipped_pairs = 0
+    nrof_skipped_pairs = 0      #不符合训练要求（比如图片文件不存在，格式不正确）的人脸对
     path_list = []
     issame_list = []
     for pair in pairs:
@@ -56,6 +65,7 @@ def get_paths(lfw_dir, pairs):
             path0 = add_extension(os.path.join(lfw_dir, pair[0], pair[0] + '_' + '%04d' % int(pair[1])))
             path1 = add_extension(os.path.join(lfw_dir, pair[2], pair[2] + '_' + '%04d' % int(pair[3])))
             issame = False
+
         if os.path.exists(path0) and os.path.exists(path1):    # Only add the pair if both paths exist
             path_list += (path0,path1)
             issame_list.append(issame)
@@ -74,6 +84,7 @@ def add_extension(path):
     else:
         raise RuntimeError('No file "%s" with extension png or jpg.' % path)
 
+#读取pairs.txt文件，将每一行变成元祖返回
 def read_pairs(pairs_filename):
     pairs = []
     with open(pairs_filename, 'r') as f:

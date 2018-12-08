@@ -43,9 +43,9 @@ from six import iteritems
 
 def triplet_loss(anchor, positive, negative, alpha):
     """Calculate the triplet loss according to the FaceNet paper
-    
+    计算三元组损失：[xa-xp]2 - [x2-xn]2 +a
     Args:
-      anchor: the embeddings for the anchor images.
+      anchor: the embeddings for the anchor images.(None,512)
       positive: the embeddings for the positive images.
       negative: the embeddings for the negative images.
   
@@ -57,22 +57,30 @@ def triplet_loss(anchor, positive, negative, alpha):
         neg_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, negative)), 1)
         
         basic_loss = tf.add(tf.subtract(pos_dist,neg_dist), alpha)
-        loss = tf.reduce_mean(tf.maximum(basic_loss, 0.0), 0)
+        loss = tf.reduce_mean(tf.maximum(basic_loss, 0.0), 0)           #沿着axis=0方向求和并reduce维度1的axis
       
     return loss
   
 def center_loss(features, label, alfa, nrof_classes):
     """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
        (http://ydwen.github.io/papers/WenECCV16.pdf)
+       计算中心损失
+       features:一批次特征向量(batch,fea_vec)
+       label:本batch中涉及到的类索引(batch,)
+       alfa：类中心向量的学习速率
+       nrof_classes:类个数。每个类一个中心，中心点和嵌入特征形状一样
     """
-    nrof_features = features.get_shape()[1]
+    nrof_features = features.get_shape()[1]                             #嵌入向量
     centers = tf.get_variable('centers', [nrof_classes, nrof_features], dtype=tf.float32,
-        initializer=tf.constant_initializer(0), trainable=False)
-    label = tf.reshape(label, [-1])
-    centers_batch = tf.gather(centers, label)
-    diff = (1 - alfa) * (centers_batch - features)
-    centers = tf.scatter_sub(centers, label, diff)
-    with tf.control_dependencies([centers]):
+        initializer=tf.constant_initializer(0), trainable=False)        #每个类一个中心，中心点和嵌入特征形状一样
+    #注意:centers是全部类的中心向量，而本batch中需要计算的类索引是label，不一定包含全部类，所以需要切片提取
+    label = tf.reshape(label, [-1])                                     #拉平,作为索引
+    centers_batch = tf.gather(centers, label)                           #从centers，中按照label，默认axis=0切片提取label所提示的类
+
+    diff = (1 - alfa) * (centers_batch - features)              #中心C每次更新delta Cj，tf.scatter_sub带状态减法
+    centers = tf.scatter_sub(centers, label, diff)              #将ref=centers中指定位置label(稀疏位置)的数减法diff（和label.shape一样）运算
+
+    with tf.control_dependencies([centers]):                    #在下面context执行前，这些graph中的张量或op必须执行
         loss = tf.reduce_mean(tf.square(features - centers_batch))
     return loss, centers
 
@@ -80,16 +88,18 @@ def get_image_paths_and_labels(dataset):
     image_paths_flat = []
     labels_flat = []
     for i in range(len(dataset)):
-        image_paths_flat += dataset[i].image_paths
+        image_paths_flat += dataset[i].image_paths              #list += 和append相同
         labels_flat += [i] * len(dataset[i].image_paths)
     return image_paths_flat, labels_flat
 
+#打散训练数据
 def shuffle_examples(image_paths, labels):
     shuffle_list = list(zip(image_paths, labels))
     random.shuffle(shuffle_list)
-    image_paths_shuff, labels_shuff = zip(*shuffle_list)
+    image_paths_shuff, labels_shuff = zip(*shuffle_list)        #解除zip
     return image_paths_shuff, labels_shuff
 
+#随机旋转图片ndarray，scipy.misc.imrotate(img,angle,interp),被skimage.transform.rotate取代
 def random_rotate_image(image):
     angle = np.random.uniform(low=-10.0, high=10.0)
     return misc.imrotate(image, angle, 'bicubic')
@@ -100,6 +110,8 @@ RANDOM_CROP = 2
 RANDOM_FLIP = 4
 FIXED_STANDARDIZATION = 8
 FLIP = 16
+
+#从队列中提取出训练用的batch:image_batch,label_batch
 def create_input_pipeline(input_queue, image_size, nrof_preprocess_threads, batch_size_placeholder):
     images_and_labels_list = []
     for _ in range(nrof_preprocess_threads):
@@ -124,7 +136,7 @@ def create_input_pipeline(input_queue, image_size, nrof_preprocess_threads, batc
                             lambda:tf.image.flip_left_right(image),
                             lambda:tf.identity(image))
             #pylint: disable=no-member
-            image.set_shape(image_size + (3,))
+            image.set_shape(image_size + (3,))          #(160,160)+(3,) = (160,160,3)
             images.append(image)
         images_and_labels_list.append([images, label])
 
@@ -136,8 +148,9 @@ def create_input_pipeline(input_queue, image_size, nrof_preprocess_threads, batc
     
     return image_batch, label_batch
 
+#control是否含有field的求和元素，例如：1+2+4,包含，1,2,4，不包含8,16
 def get_control_flag(control, field):
-    return tf.equal(tf.mod(tf.floor_div(control, field), 2), 1)
+    return tf.equal(tf.mod(tf.floor_div(control, field), 2), 1)     #control/field 然后mod 2是否=1
   
 def _add_loss_summaries(total_loss):
     """Add summaries for losses.
@@ -302,33 +315,36 @@ def get_learning_rate_from_file(filename, epoch):
                 else:
                     return learning_rate
 
+#存放“人名-人脸path的list"
 class ImageClass():
     "Stores the paths to images for a given class"
     def __init__(self, name, image_paths):
-        self.name = name
-        self.image_paths = image_paths
+        self.name = name                            #人名字
+        self.image_paths = image_paths              #人脸路径list
   
     def __str__(self):
         return self.name + ', ' + str(len(self.image_paths)) + ' images'
   
-    def __len__(self):
+    def __len__(self):                              #人脸张数
         return len(self.image_paths)
-  
+
+#dataset是个列表，元素是ImageClass
 def get_dataset(path, has_class_directories=True):
     dataset = []
-    path_exp = os.path.expanduser(path)
-    classes = [path for path in os.listdir(path_exp) \
+    path_exp = os.path.expanduser(path)                             #数据目录结构是： lwf/人名/人脸图片.jpg
+    classes = [path for path in os.listdir(path_exp) \              #人名 = classes，是目录
                     if os.path.isdir(os.path.join(path_exp, path))]
     classes.sort()
     nrof_classes = len(classes)
     for i in range(nrof_classes):
         class_name = classes[i]
-        facedir = os.path.join(path_exp, class_name)
+        facedir = os.path.join(path_exp, class_name)                #具体某人的目录
         image_paths = get_image_paths(facedir)
         dataset.append(ImageClass(class_name, image_paths))
   
     return dataset
 
+#facedir具体某人的目录
 def get_image_paths(facedir):
     image_paths = []
     if os.path.isdir(facedir):
@@ -336,15 +352,17 @@ def get_image_paths(facedir):
         image_paths = [os.path.join(facedir,img) for img in images]
     return image_paths
   
+#split_ration 测试集占比，mode：切分类，切分图片
 def split_dataset(dataset, split_ratio, min_nrof_images_per_class, mode):
     if mode=='SPLIT_CLASSES':
         nrof_classes = len(dataset)
         class_indices = np.arange(nrof_classes)
         np.random.shuffle(class_indices)
+
         split = int(round(nrof_classes*(1-split_ratio)))
-        train_set = [dataset[i] for i in class_indices[0:split]]
+        train_set = [dataset[i] for i in class_indices[0:split]]        #dataset[ [class_indices[0:split]] ]
         test_set = [dataset[i] for i in class_indices[split:-1]]
-    elif mode=='SPLIT_IMAGES':
+    elif mode=='SPLIT_IMAGES':      #逐个类的切分，保证每个类至少有一个
         train_set = []
         test_set = []
         for cls in dataset:
@@ -354,6 +372,7 @@ def split_dataset(dataset, split_ratio, min_nrof_images_per_class, mode):
             split = int(math.floor(nrof_images_in_class*(1-split_ratio)))
             if split==nrof_images_in_class:
                 split = nrof_images_in_class-1
+
             if split>=min_nrof_images_per_class and nrof_images_in_class-split>=1:
                 train_set.append(ImageClass(cls.name, paths[:split]))
                 test_set.append(ImageClass(cls.name, paths[split:]))
@@ -361,6 +380,7 @@ def split_dataset(dataset, split_ratio, min_nrof_images_per_class, mode):
         raise ValueError('Invalid train/test split mode "%s"' % mode)
     return train_set, test_set
 
+#从目录或文件将模型加载到当前缺省sess
 def load_model(model, input_map=None):
     # Check if the model is a model directory (containing a metagraph and a checkpoint file)
     #  or if it is a protobuf file with a frozen graph
@@ -369,34 +389,44 @@ def load_model(model, input_map=None):
         print('Model filename: %s' % model_exp)
         with gfile.FastGFile(model_exp,'rb') as f:
             graph_def = tf.GraphDef()
-            graph_def.ParseFromString(f.read())
-            tf.import_graph_def(graph_def, input_map=input_map, name='')
+            graph_def.ParseFromString(f.read())         #从文件中加载图定义
+            tf.import_graph_def(graph_def, input_map=input_map, name='') #将图定义中的模型加载到当前缺省sess
+            #Imports the graph from `graph_def` into the current default `Graph`.
     else:
         print('Model directory: %s' % model_exp)
         meta_file, ckpt_file = get_model_filenames(model_exp)
         
         print('Metagraph file: %s' % meta_file)
         print('Checkpoint file: %s' % ckpt_file)
-      
+
+        #从.meta文件中导入saver,Recreates a Graph saved in a `MetaGraphDef` proto.
         saver = tf.train.import_meta_graph(os.path.join(model_exp, meta_file), input_map=input_map)
+
+        #从ckpt文件中恢复变量到当前session. tf.get_default_session()当前线程的缺省会话，每个线程都有一个session
         saver.restore(tf.get_default_session(), os.path.join(model_exp, ckpt_file))
-    
+
+#验证目录中的模型文件：有且只有一个.meta文件，提取最新的模型ckpt文件
 def get_model_filenames(model_dir):
     files = os.listdir(model_dir)
     meta_files = [s for s in files if s.endswith('.meta')]
+
+    #有且只能有一个.meta文件
     if len(meta_files)==0:
         raise ValueError('No meta file found in the model directory (%s)' % model_dir)
     elif len(meta_files)>1:
         raise ValueError('There should not be more than one meta file in the model directory (%s)' % model_dir)
     meta_file = meta_files[0]
-    ckpt = tf.train.get_checkpoint_state(model_dir)
-    if ckpt and ckpt.model_checkpoint_path:
-        ckpt_file = os.path.basename(ckpt.model_checkpoint_path)
+
+    ckpt = tf.train.get_checkpoint_state(model_dir)     #返回CheckpointState状态
+    if ckpt and ckpt.model_checkpoint_path:             #
+        ckpt_file = os.path.basename(ckpt.model_checkpoint_path)   #返回目录的文件部分。os.path.dirname返回目录部分。
         return meta_file, ckpt_file
 
+    #提取最新的ckpt模型文件
     meta_files = [s for s in files if '.ckpt' in s]
     max_step = -1
-    for f in files:
+    # for f in files:
+    for f in meta_files:
         step_str = re.match(r'(^model-[\w\- ]+.ckpt-(\d+))', f)
         if step_str is not None and len(step_str.groups())>=2:
             step = int(step_str.groups()[1])
@@ -404,70 +434,93 @@ def get_model_filenames(model_dir):
                 max_step = step
                 ckpt_file = step_str.groups()[0]
     return meta_file, ckpt_file
-  
+
+#两个人脸特征向量的距离:欧式，余弦距离（角度归一化）
+#embeddings1:(batch_size,fea_vec_len)
+#返回(batch_size,)
 def distance(embeddings1, embeddings2, distance_metric=0):
+    #注意：axis = 1，针对特征向量，axis=0是batch维度
     if distance_metric==0:
         # Euclidian distance
         diff = np.subtract(embeddings1, embeddings2)
-        dist = np.sum(np.square(diff),1)
+        dist = np.sum(np.square(diff),axis=1)
     elif distance_metric==1:
-        # Distance based on cosine similarity
-        dot = np.sum(np.multiply(embeddings1, embeddings2), axis=1)
+        # Distance based on cosine similarity       #shape = (batch_size,fea_vec_len)
+        dot = np.sum(np.multiply(embeddings1, embeddings2), axis=1)  #shape = (batch_size,)
         norm = np.linalg.norm(embeddings1, axis=1) * np.linalg.norm(embeddings2, axis=1)
-        similarity = dot / norm
-        dist = np.arccos(similarity) / math.pi
+        similarity = dot / norm                     #cos(t) = x1*x2/[x1]2*[x2]2
+        dist = np.arccos(similarity) / math.pi      #求出t,并归一化到（0,1）
     else:
         raise 'Undefined distance metric %d' % distance_metric 
         
     return dist
 
+#滑动阈值，K折计算平均k此的tpr,fpr,accuracy，用来计算roc
 def calculate_roc(thresholds, embeddings1, embeddings2, actual_issame, nrof_folds=10, distance_metric=0, subtract_mean=False):
-    assert(embeddings1.shape[0] == embeddings2.shape[0])
-    assert(embeddings1.shape[1] == embeddings2.shape[1])
+    '''
+    :param nrof_folds:交叉验证次数，折数。Number of folds to use for cross validation.
+    '''
+    assert(embeddings1.shape[0] == embeddings2.shape[0])        #batch一样
+    assert(embeddings1.shape[1] == embeddings2.shape[1])        #fea_vec长度一样
     nrof_pairs = min(len(actual_issame), embeddings1.shape[0])
     nrof_thresholds = len(thresholds)
-    k_fold = KFold(n_splits=nrof_folds, shuffle=False)
+    k_fold = KFold(n_splits=nrof_folds, shuffle=False)      #K-Folds cross-validator,负责生成train,test数据集的index
     
-    tprs = np.zeros((nrof_folds,nrof_thresholds))
+    tprs = np.zeros((nrof_folds,nrof_thresholds))           #一个threadhold对应一对tpr,fpr
     fprs = np.zeros((nrof_folds,nrof_thresholds))
-    accuracy = np.zeros((nrof_folds))
+    accuracy = np.zeros((nrof_folds))                       #每次验证对应一个acc，nrof_folds可用来计算均值，方差
     
-    indices = np.arange(nrof_pairs)
+    indices = np.arange(nrof_pairs)                         #数据集的index,将数据集split分成train,test
     
     for fold_idx, (train_set, test_set) in enumerate(k_fold.split(indices)):
         if subtract_mean:
-            mean = np.mean(np.concatenate([embeddings1[train_set], embeddings2[train_set]]), axis=0)
+            mean = np.mean(np.concatenate([embeddings1[train_set], embeddings2[train_set]]), axis=0)  #axis=0,计算的是每个fea维度上的均值
         else:
           mean = 0.0
         dist = distance(embeddings1-mean, embeddings2-mean, distance_metric)
         
-        # Find the best threshold for the fold
+        # Find the best threshold for the fold  准确度最大的那个阈值
         acc_train = np.zeros((nrof_thresholds))
         for threshold_idx, threshold in enumerate(thresholds):
             _, _, acc_train[threshold_idx] = calculate_accuracy(threshold, dist[train_set], actual_issame[train_set])
+
         best_threshold_index = np.argmax(acc_train)
+
         for threshold_idx, threshold in enumerate(thresholds):
             tprs[fold_idx,threshold_idx], fprs[fold_idx,threshold_idx], _ = calculate_accuracy(threshold, dist[test_set], actual_issame[test_set])
+
+        #记录每次分拆样本测试时，最优的准确率：找到最优的阈值，计算相应的准确率。
         _, _, accuracy[fold_idx] = calculate_accuracy(thresholds[best_threshold_index], dist[test_set], actual_issame[test_set])
           
-        tpr = np.mean(tprs,0)
-        fpr = np.mean(fprs,0)
+    tpr = np.mean(tprs,0)       #k-fold后，每个阈值对应的平均tpr，fpr
+    fpr = np.mean(fprs,0)
     return tpr, fpr, accuracy
 
+#dist:(batch_size,),actual_issame:(batch_size,),threadhold:距离阈值
 def calculate_accuracy(threshold, dist, actual_issame):
     predict_issame = np.less(dist, threshold)
+
+    '''
+        预测值 真实值
+    TP:   T     T
+    FP:   T     F
+    TN:   F     F
+    FN:   F     T
+    '''
     tp = np.sum(np.logical_and(predict_issame, actual_issame))
     fp = np.sum(np.logical_and(predict_issame, np.logical_not(actual_issame)))
     tn = np.sum(np.logical_and(np.logical_not(predict_issame), np.logical_not(actual_issame)))
     fn = np.sum(np.logical_and(np.logical_not(predict_issame), actual_issame))
-  
-    tpr = 0 if (tp+fn==0) else float(tp) / float(tp+fn)
-    fpr = 0 if (fp+tn==0) else float(fp) / float(fp+tn)
-    acc = float(tp+tn)/dist.size
+
+    #ROC用来描绘真阳和假阳的trade-off.阈值逐步宽松时，真阳和假阳比例都会增加，直到100%，但准确率不一定，存在一个最优的阈值相对应
+    tpr = 0 if (tp+fn==0) else float(tp) / float(tp+fn)     #真阳性概率/召回率：TP/N+,预测的正确的正样本占全部正样本的比例,=召回率
+    fpr = 0 if (fp+tn==0) else float(fp) / float(fp+tn)     #假阳性概率/误报率：FP/N-,预测的错误的正样本（误报正样本），占全部负样本的比例
+    acc = float(tp+tn)/dist.size                            #准确率：预测正确的样本占全部样本的比例
     return tpr, fpr, acc
 
 
-  
+#经过10-折计算出平均的正确接受率及方差、错误接受率
+#far_target:错误接受率阈值，FAR=FP/(TN+FP)，误认为同一人的对数/所有不同一人的对数
 def calculate_val(thresholds, embeddings1, embeddings2, actual_issame, far_target, nrof_folds=10, distance_metric=0, subtract_mean=False):
     assert(embeddings1.shape[0] == embeddings2.shape[0])
     assert(embeddings1.shape[1] == embeddings2.shape[1])
@@ -491,12 +544,14 @@ def calculate_val(thresholds, embeddings1, embeddings2, actual_issame, far_targe
         far_train = np.zeros(nrof_thresholds)
         for threshold_idx, threshold in enumerate(thresholds):
             _, far_train[threshold_idx] = calculate_val_far(threshold, dist[train_set], actual_issame[train_set])
+
+        #此threadhold对应的FAR符合far_target，在插值计算此threadhold下的VAL和FAR
         if np.max(far_train)>=far_target:
-            f = interpolate.interp1d(far_train, thresholds, kind='slinear')
+            f = interpolate.interp1d(far_train, thresholds, kind='slinear')     #x:FAR,y:threadhold，为了找距离阈值
             threshold = f(far_target)
         else:
             threshold = 0.0
-    
+
         val[fold_idx], far[fold_idx] = calculate_val_far(threshold, dist[test_set], actual_issame[test_set])
   
     val_mean = np.mean(val)
@@ -504,7 +559,7 @@ def calculate_val(thresholds, embeddings1, embeddings2, actual_issame, far_targe
     val_std = np.std(val)
     return val_mean, val_std, far_mean
 
-
+#计算FAR，VAL验证率：TP/(TP+FN)
 def calculate_val_far(threshold, dist, actual_issame):
     predict_issame = np.less(dist, threshold)
     true_accept = np.sum(np.logical_and(predict_issame, actual_issame))

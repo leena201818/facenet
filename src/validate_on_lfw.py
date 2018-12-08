@@ -72,7 +72,7 @@ def main(args):
             input_map = {'image_batch': image_batch, 'label_batch': label_batch, 'phase_train': phase_train_placeholder}
             facenet.load_model(args.model, input_map=input_map)
 
-            # Get output tensor
+            # Get output tensor，仅得到该张量的引用，并非计算该张量
             embeddings = tf.get_default_graph().get_tensor_by_name("embeddings:0")
 #              
             coord = tf.train.Coordinator()
@@ -88,52 +88,68 @@ def evaluate(sess, enqueue_op, image_paths_placeholder, labels_placeholder, phas
     # Run forward pass to calculate embeddings
     print('Runnning forward pass on LFW images')
     
-    # Enqueue one epoch of image paths and labels
-    nrof_embeddings = len(actual_issame)*2  # nrof_pairs * nrof_images_per_pair
-    nrof_flips = 2 if use_flipped_images else 1
-    nrof_images = nrof_embeddings * nrof_flips
-    labels_array = np.expand_dims(np.arange(0,nrof_images),1)
+    # Enqueue one epoch of image paths and labels，入队一批图片和标签
+    nrof_embeddings = len(actual_issame)*2          # nrof_pairs * nrof_images_per_pair，全部原始图片的数量=pairs数量×一个paris图片数量
+    nrof_flips = 2 if use_flipped_images else 1     #是否采用翻转图片
+    nrof_images = nrof_embeddings * nrof_flips      #输入到模型的图片数量，包括翻转图片（一张原图片对应一个翻转图片）
+
+    labels_array = np.expand_dims(np.arange(0,nrof_images),1)       #[0,1,...,5999],变为列向量
+    # 图片路径列向量，repeat是为了放置翻转图片path，注意，repeat的行为和concatenate的行为不同，前者重复元素挨着，后者是成块拼接，这个决定了模型输出向量的拼接方式
     image_paths_array = np.expand_dims(np.repeat(np.array(image_paths),nrof_flips),1)
-    control_array = np.zeros_like(labels_array, np.int32)
-    if use_fixed_image_standardization:
+    control_array = np.zeros_like(labels_array, np.int32)           #控制每个图片预处理的向量，和labels_array同形，列向量
+
+    if use_fixed_image_standardization:                             #采用均值127.5的标准化处理过程到(0,1)，而不是tf自带的x-mean/std的标准化
         control_array += np.ones_like(labels_array)*facenet.FIXED_STANDARDIZATION
+
     if use_flipped_images:
         # Flip every second image
-        control_array += (labels_array % 2)*facenet.FLIP
+        control_array += (labels_array % 2)*facenet.FLIP            #labels_array % 2 :[0,1,0,1,...]，每间隔2张图片，有一个需要翻转
+
+    #输入队列（图片path，图片标签，图片预处理方式）
     sess.run(enqueue_op, {image_paths_placeholder: image_paths_array, labels_placeholder: labels_array, control_placeholder: control_array})
     
-    embedding_size = int(embeddings.get_shape()[1])
+    embedding_size = int(embeddings.get_shape()[1])                 #特征向量维度
     assert nrof_images % batch_size == 0, 'The number of LFW images must be an integer multiple of the LFW batch size'
-    nrof_batches = nrof_images // batch_size
-    emb_array = np.zeros((nrof_images, embedding_size))
-    lab_array = np.zeros((nrof_images,))
+    nrof_batches = nrof_images // batch_size                        #总批数 = 样本数//每批样本数
+    emb_array = np.zeros((nrof_images, embedding_size))             #全部样本的嵌入向量
+    lab_array = np.zeros((nrof_images,))                            #全部样本对应的label
+    #分成batch进行推断，mini_batch
     for i in range(nrof_batches):
         feed_dict = {phase_train_placeholder:False, batch_size_placeholder:batch_size}
         emb, lab = sess.run([embeddings, labels], feed_dict=feed_dict)
         lab_array[lab] = lab
         emb_array[lab, :] = emb
-        if i % 10 == 9:
+        if i % 10 == 9:                                             #每10个batch就显示进度.
             print('.', end='')
             sys.stdout.flush()
     print('')
-    embeddings = np.zeros((nrof_embeddings, embedding_size*nrof_flips))
+
+    embeddings = np.zeros((nrof_embeddings, embedding_size*nrof_flips))     #原始图片和翻转图片的嵌入向量拼接成最终特征向量
     if use_flipped_images:
         # Concatenate embeddings for flipped and non flipped version of the images
-        embeddings[:,:embedding_size] = emb_array[0::2,:]
-        embeddings[:,embedding_size:] = emb_array[1::2,:]
+        embeddings[:,:embedding_size] = emb_array[0::2,:]           #注意：np.repeate(image_paths,2)方式，导致原图片和翻转图片是相邻的[a,a,b,b],不是[a,b...a,b]
+        embeddings[:,embedding_size:] = emb_array[1::2,:]           #embeddings的宽度是emb_array宽度的2倍，emb_array[1::2]，从1开始每间隔2取样
     else:
         embeddings = emb_array
 
     assert np.array_equal(lab_array, np.arange(nrof_images))==True, 'Wrong labels used for evaluation, possibly caused by training examples left in the input pipeline'
+
     tpr, fpr, accuracy, val, val_std, far = lfw.evaluate(embeddings, actual_issame, nrof_folds=nrof_folds, distance_metric=distance_metric, subtract_mean=subtract_mean)
     
     print('Accuracy: %2.5f+-%2.5f' % (np.mean(accuracy), np.std(accuracy)))
-    print('Validation rate: %2.5f+-%2.5f @ FAR=%2.5f' % (val, val_std, far))
+    print('Validation rate(TAR): %2.5f+-%2.5f @ FAR=%2.5f' % (val, val_std, far))
     
-    auc = metrics.auc(fpr, tpr)
+    auc = metrics.auc(fpr, tpr)                     #from sklearn import metrics，给定tpr,fpt计算auc，绘制roc
     print('Area Under Curve (AUC): %1.3f' % auc)
-    eer = brentq(lambda x: 1. - x - interpolate.interp1d(fpr, tpr)(x), 0., 1.)
-    print('Equal Error Rate (EER): %1.3f' % eer)
+    # brentq是scipy.optimize中混合求根方法，先用一种方法求解，如果速度不快，则寻找另外更好的方法，加速求解
+    eer = brentq(lambda x: 1. - x - interpolate.interp1d(fpr, tpr)(x), 0., 1.)   #等效错误率，从(0,1)到(1,0)的直线和ROC曲线的交点，其横坐标就是EER
+    print('Equal Error Rate (EER): %1.3f' % eer)            #EER也就是FPR=FNR的值，由于FNR=1-TPR，可以画一条从（0,1）到（1,0）的直线，找到交点
+
+    import matplotlib.pyplot as plt
+    plt.plot(fpr,tpr,'-')
+    plt.title('ROC')
+    plt.show()
+
     
 def parse_arguments(argv):
     parser = argparse.ArgumentParser()
